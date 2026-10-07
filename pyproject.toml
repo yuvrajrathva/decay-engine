@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decay-engine"
+version = "0.1.0"
+description = "Keeps an AI agent's long-term memory store clean over time."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Yuvraj Rathva" }]
+keywords = ["ai", "agents", "memory", "vector-database", "chroma", "pgvector", "postgres"]
+dependencies = []
+
+[project.optional-dependencies]
+chroma = ["chromadb>=0.4"]
+pgvector = ["psycopg[binary]>=3.1"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["decay_engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

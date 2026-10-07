@@ -1,0 +1,68 @@
+# ---- Secrets -----------------------------------------------------------
+# .env holds the real POSTGRES_PASSWORD used by docker-compose and the live
+# pgvector tests. Never commit it; .env.example is the tracked template.
+.env
+.env.*
+!.env.example
+
+# ---- Python bytecode ---------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ---- Virtual environments ----------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Packaging / build artifacts ---------------------------------------
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# ---- Testing and coverage ----------------------------------------------
+.pytest_cache/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit*.xml
+
+# ---- Type checkers and linters -----------------------------------------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ---- Local store data --------------------------------------------------
+# Chroma's PersistentClient and any Postgres volume mounted into the repo.
+# Test fixtures should write to tmp_path, so anything here is a stray run.
+.chroma/
+chroma/
+chroma_db/
+*.sqlite3
+*.sqlite3-journal
+pgdata/
+postgres_data/
+
+# ---- Editors and OS ----------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
