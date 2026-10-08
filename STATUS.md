@@ -1,15 +1,17 @@
 # Build status
 
-Where `decay-engine` actually stands, as of 2026-10-06. For how to *use* it, see
+Where `decay-engine` actually stands, as of 2026-10-07. For how to *use* it, see
 [README.md](README.md); this file is the inventory of what exists, what each
 piece is, and what is still missing.
 
-Version `0.1.0`. Python 3.10.12, zero runtime dependencies in the core.
-**110 tests passing** (30 policy, 25 engine, 15 Chroma, 40 pgvector), lint clean.
+Version `0.1.0`, requires Python >=3.9, zero runtime dependencies in the core.
+**160 tests passing** (30 policy, 25 engine, 22 scoping, 25 Chroma, 58 pgvector),
+lint clean. Builds and installs as a wheel and an sdist; not published to PyPI.
 
 Deeper documentation:
 [timestamps and the grace period](docs/timestamps-and-grace-period.md),
-[access tracking](docs/access-tracking.md).
+[access tracking](docs/access-tracking.md),
+[scoped sweeps](docs/scoped-sweeps.md).
 
 ## The vocabulary
 
@@ -27,6 +29,7 @@ One line each, in roughly the order data flows through them.
 | **Verdict** | A policy's decision about one record, carrying the action, the strength score, and a human-readable reason it can be audited by. |
 | **DecayEngine** | The orchestrator: reads the whole store, asks the policy about every record, then applies the verdicts — but only if you asked it to. |
 | **SweepReport** | The outcome of a sweep: every verdict, the counts, and which ids were evicted, demoted, or promoted — filled in on a dry run as well, with `applied` saying whether any of it happened. |
+| **Scope** | An optional, backend-specific filter narrowing a sweep to a subset of records. The core never inspects one — it forwards it to the adapter, which is why the library has no notion of tenants or namespaces. |
 | **Strength** | A record's score in `(0, 1]`. Exponential decay on idle time, with usage stretching the half-life. The number every decision comes from. |
 
 Two distinctions in that table carry weight:
@@ -52,6 +55,9 @@ Two distinctions in that table carry weight:
 | Policy contract | `decay_engine/policies/base.py` | **Done.** `Action`, `Verdict`, and a runtime-checkable `Policy` protocol. |
 | **Decay policy** | `decay_engine/policies/decay.py` | **Done.** Recency × usage scoring, three-band thresholds, and the four protections below. |
 | **Sweep engine** | `decay_engine/engine.py` | **Done.** Read phase then write phase, never interleaved. Dry run by default, eviction ceiling, promotion of revived records, per-verdict audit callback. A report records its decisions before either path acts, so `evicted_ids` / `demoted_ids` / `promoted_ids` are populated on dry runs too and `applied` is the only flag that differs. |
+| **Scoped sweeps** | `engine.py`, both adapters | **Done.** `sweep(scope=…)` and `evaluate(scope=…)` narrow a sweep. Chroma takes a `where` mapping or `ChromaScope`; pgvector takes a JSONB-containment mapping or a parameterized `PgVectorScope`; the in-memory store takes a predicate or mapping. Unscoped behavior is unchanged, and the keyword is not even passed when unscoped, so pre-scope adapters still work. An adapter that cannot scope raises `ScopeNotSupported` rather than widening. |
+| **Packaging** | `pyproject.toml`, `MANIFEST.in`, `LICENSE` | **Done.** PEP 621 metadata, classifiers, MIT license, `py.typed` (PEP 561). Core has no dependencies; `chroma`, `pgvector`, `all` and `dev` extras. Wheel carries only the package; sdist also carries tests, docs and the example. |
+| Build verification | `scripts/verify_build.sh` | **Done.** Builds both artifacts, asserts the wheel ships `py.typed` and no tests or `.env`, installs the core into a clean virtualenv and asserts nothing third-party came with it, resolves every extra, then runs the suite against the installed package from a directory containing no source tree. |
 | Worked example | `examples/preview_sweep.py` | **Done.** Runnable: prints a full verdict table over seven synthetic memories. |
 
 ### The scoring model, concretely
@@ -95,8 +101,6 @@ the wrong failure direction.
   for `0.1.0`. The `Policy` protocol is the seam they would plug into.
 - **Policy composition.** `DecayEngine` takes exactly one policy; there is no
   pipeline that runs several and reconciles their verdicts.
-- **Scoped sweeps.** `sweep()` always walks the whole collection. No filtering to
-  a namespace, tenant, or user — which multi-tenant stores will need.
 - **Access-count writing.** Nothing here increments `access_count` or
   `last_accessed_at`; the library only reads them. The host application must
   record retrievals — see [docs/access-tracking.md](docs/access-tracking.md).
@@ -106,13 +110,18 @@ the wrong failure direction.
 - **First-class column writes (pgvector).** `extra_columns` is read-only. Decay's
   own writes always go to the `jsonb` column, so a schema with no `jsonb` column
   can be swept in dry-run and evicted from, but not demoted.
-- **Packaging.** Not published to PyPI, and not committed to git — the directory
-  is untracked inside the parent `Devdev` repo.
+- **Scoped writes.** A scope narrows which records are *read*; demotions and
+  deletions then act on the ids that read returned. There is no separate
+  server-side scoped `DELETE`, so a very large scoped eviction is still one
+  delete per batch of ids rather than one statement.
+- **Publishing.** Builds locally, but not uploaded to PyPI, and not committed to
+  git — the directory is untracked inside the parent `Devdev` repo.
 
 ## Verification
 
 ```bash
-.venv/bin/python -m pytest        # 110 passed
+.venv/bin/python -m pytest        # 160 passed with both backends running
+./scripts/verify_build.sh         # build, install and installed-package tests
 ```
 
 The suite needs neither a database nor `chromadb` to run. Each adapter is tested
@@ -133,26 +142,14 @@ DECAY_ENGINE_PG_DSN="postgresql://postgres:decay@localhost:55432/decay" \
 ```
 
 Coverage by area: the decay curve and its refusals (30), sweep orchestration and
-the safety guards (25), Chroma paging and metadata merging (15), pgvector
-construction, paging, merging, deletion and identifier safety (40).
+the safety guards (25), scope forwarding and the unscoped guarantee (22), Chroma
+paging, metadata merging and `where` filters (25), pgvector construction, paging,
+merging, deletion, identifier safety and scope SQL (58).
+
+`scripts/verify_build.sh` additionally runs the suite against an installed wheel:
+**153 passed, 7 skipped** there, the 7 being the live-backend tests that skip
+without a database or `chromadb`.
 
 ## Open questions
 
-1. **Demotion only pays off if the retrieval layer reads it.** The library writes
-   `decay_cold` and `decay_strength` and trusts you to filter or re-rank on them.
-   If an agent ignores those fields, demotion is a no-op and eviction does all
-   the work — which changes how the thresholds should be tuned.
-2. **Access tracking is the real dependency, and it is the host's job.** Without
-   a counter something increments on retrieval, decay degrades to pure aging and
-   no record ever earns tenure. Documented in
-   [docs/access-tracking.md](docs/access-tracking.md); still worth considering
-   whether the library should ship an opt-in helper that does the increment.
-3. **The grace period reads `created_at`** (`policies/decay.py:122`), so a
-   backfilled import with original timestamps bypasses it. That is now a
-   documented, deliberate choice — the developer picks which timestamp means
-   "created" — rather than an open bug. See
-   [docs/timestamps-and-grace-period.md](docs/timestamps-and-grace-period.md).
-   The open part is whether `FieldMap` should grow a distinct `inserted_at` so
-   both the true creation time and the store-entry time can be honored at once.
-4. **Scoped sweeps.** Multi-tenant stores will want to sweep one namespace at a
-   time; `sweep()` currently always walks everything.
+None

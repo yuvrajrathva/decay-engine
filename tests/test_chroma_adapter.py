@@ -11,7 +11,7 @@ import pytest
 
 from conftest import record
 from decay_engine import COLD_FLAG, DecayEngine, DecayPolicy
-from decay_engine.adapters.chroma import ChromaAdapter
+from decay_engine.adapters.chroma import ChromaAdapter, ChromaScope
 
 SCALARS = (str, int, float, bool)
 
@@ -31,10 +31,17 @@ class FakeCollection:
             self._docs[item.id] = item.text
             self._meta[item.id] = dict(item.metadata)
 
-    def get(self, ids=None, limit=None, offset=None, include=None):
-        self.get_calls.append({"ids": ids, "limit": limit, "offset": offset})
-        selected = ids if ids is not None else self._ids[offset or 0 :][:limit]
-        selected = [i for i in selected if i in self._meta]
+    def get(self, ids=None, limit=None, offset=None, include=None,
+            where=None, where_document=None):
+        self.get_calls.append(
+            {"ids": ids, "limit": limit, "offset": offset,
+             "where": where, "where_document": where_document}
+        )
+        if ids is not None:
+            selected = [i for i in ids if i in self._meta]
+        else:
+            matching = [i for i in self._ids if self._matches(i, where, where_document)]
+            selected = matching[offset or 0 :][:limit]
         return {
             "ids": selected,
             "documents": [self._docs.get(i) for i in selected],
@@ -61,6 +68,29 @@ class FakeCollection:
 
     def count(self):
         return len(self._ids)
+
+    def _matches(self, record_id, where, where_document):
+        """Chroma's filter semantics, limited to the operators under test."""
+        if where:
+            metadata = self._meta.get(record_id) or {}
+            for key, condition in where.items():
+                if isinstance(condition, dict):
+                    for operator, operand in condition.items():
+                        held = metadata.get(key)
+                        if operator == "$eq" and held != operand:
+                            return False
+                        if operator == "$ne" and held == operand:
+                            return False
+                        if operator == "$in" and held not in operand:
+                            return False
+                elif metadata.get(key) != condition:
+                    return False
+        if where_document:
+            document = self._docs.get(record_id) or ""
+            contains = where_document.get("$contains")
+            if contains is not None and contains not in document:
+                return False
+        return True
 
 
 @pytest.fixture
@@ -200,3 +230,125 @@ class TestAgainstRealChroma:
         remaining = collection.get(ids=["hot"], include=["metadatas"])["metadatas"][0]
         assert remaining["source"] == "slack"
         assert remaining[COLD_FLAG] is False
+
+    def test_scoped_sweep_against_a_live_collection(self, tmp_path, now):
+        """Chroma's own `where` engine, not the double's."""
+        chromadb = pytest.importorskip("chromadb")
+        client = chromadb.PersistentClient(path=str(tmp_path / "scoped"))
+        collection = client.create_collection("memories")
+        collection.add(
+            ids=["acme-hot", "acme-dead", "globex-dead"],
+            documents=["fresh", "abandoned", "abandoned"],
+            embeddings=[[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+            metadatas=[
+                {"tenant_id": "acme",
+                 "created_at": (now - timedelta(days=20)).isoformat(),
+                 "last_accessed_at": (now - timedelta(days=1)).isoformat()},
+                {"tenant_id": "acme",
+                 "created_at": (now - timedelta(days=420)).isoformat(),
+                 "last_accessed_at": (now - timedelta(days=400)).isoformat()},
+                {"tenant_id": "globex",
+                 "created_at": (now - timedelta(days=420)).isoformat(),
+                 "last_accessed_at": (now - timedelta(days=400)).isoformat()},
+            ],
+        )
+        policy = DecayPolicy(
+            half_life=timedelta(days=30), demote_below=0.5, evict_below=0.1
+        )
+        adapter = ChromaAdapter(collection)
+
+        report = DecayEngine(adapter, policy).sweep(
+            dry_run=False, now=now, scope={"tenant_id": "acme"}
+        )
+        assert report.scanned == 2
+        assert report.evicted_ids == ["acme-dead"]
+        assert collection.count() == 2  # globex-dead was out of scope
+
+        report = DecayEngine(adapter, policy).sweep(dry_run=False, now=now)
+        assert report.evicted_ids == ["globex-dead"]
+        assert collection.count() == 1
+
+
+class TestScopedSweeps:
+    """Narrowing a sweep to a subset of a collection."""
+
+    @pytest.fixture
+    def tenants(self, now):
+        items = []
+        for tenant in ("acme", "globex"):
+            for name, idle in (("hot", 1), ("dead", 300)):
+                items.append(
+                    record(f"{tenant}-{name}", idle_days=idle,
+                           extra={"tenant_id": tenant}, now=now)
+                )
+        return FakeCollection(items)
+
+    @pytest.fixture
+    def policy(self):
+        return DecayPolicy(
+            half_life=timedelta(days=30), demote_below=0.5, evict_below=0.1
+        )
+
+    def test_unscoped_sweep_still_covers_the_whole_collection(self, tenants, policy, now):
+        report = DecayEngine(ChromaAdapter(tenants), policy).sweep(now=now)
+        assert report.scanned == 4
+        assert sorted(report.evicted_ids) == ["acme-dead", "globex-dead"]
+        assert tenants.get_calls[0]["where"] is None
+
+    def test_unscoped_sweep_passes_no_where_at_all(self, tenants, policy, now):
+        """Not even an empty dict, which some Chroma versions reject."""
+        DecayEngine(ChromaAdapter(tenants), policy).sweep(now=now)
+        assert all(call["where"] is None for call in tenants.get_calls)
+
+    def test_mapping_scope_becomes_chromas_where(self, tenants, policy, now):
+        report = DecayEngine(ChromaAdapter(tenants), policy).sweep(
+            now=now, scope={"tenant_id": "acme"}
+        )
+        assert report.scanned == 2
+        assert report.evicted_ids == ["acme-dead"]
+        assert tenants.get_calls[0]["where"] == {"tenant_id": "acme"}
+
+    def test_scoped_apply_leaves_other_records_untouched(self, tenants, policy, now):
+        DecayEngine(ChromaAdapter(tenants), policy).sweep(
+            dry_run=False, now=now, scope={"tenant_id": "acme"}
+        )
+        assert sorted(tenants._ids) == ["acme-hot", "globex-dead", "globex-hot"]
+
+    def test_chroma_operators_pass_through(self, tenants, policy, now):
+        report = DecayEngine(ChromaAdapter(tenants), policy).sweep(
+            now=now, scope={"tenant_id": {"$in": ["acme", "globex"]}}
+        )
+        assert report.scanned == 4
+
+    def test_chroma_scope_carries_a_document_filter(self, tenants, policy, now):
+        scope = ChromaScope(
+            where={"tenant_id": "acme"}, where_document={"$contains": "dead"}
+        )
+        report = DecayEngine(ChromaAdapter(tenants), policy).sweep(now=now, scope=scope)
+        assert report.scanned == 1
+        assert report.evicted_ids == ["acme-dead"]
+        assert tenants.get_calls[0]["where_document"] == {"$contains": "dead"}
+
+    def test_scope_pages_through_the_filtered_set(self, now, policy):
+        items = [
+            record(f"m-{i:03d}", idle_days=1, extra={"tenant_id": "acme" if i % 2 else "globex"}, now=now)
+            for i in range(200)
+        ]
+        collection = FakeCollection(items)
+        found = list(
+            ChromaAdapter(collection).iter_records(
+                batch_size=25, scope={"tenant_id": "acme"}
+            )
+        )
+        assert len(found) == 100
+        assert all(r.metadata["tenant_id"] == "acme" for r in found)
+        assert [c["offset"] for c in collection.get_calls] == [0, 25, 50, 75, 100]
+
+    def test_an_empty_mapping_scope_sweeps_everything(self, tenants, policy, now):
+        """An empty dict is Chroma's own 'no filter', so it is not an error here."""
+        report = DecayEngine(ChromaAdapter(tenants), policy).sweep(now=now, scope={})
+        assert report.scanned == 4
+
+    def test_an_unknown_scope_shape_is_refused(self, tenants):
+        with pytest.raises(TypeError, match="must be a mapping"):
+            list(ChromaAdapter(tenants).iter_records(scope=["tenant_id", "acme"]))

@@ -10,6 +10,7 @@ and `applied` is what distinguishes a preview from a change.
 
 from __future__ import annotations
 
+import inspect
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,7 +21,15 @@ from .models import utcnow
 from .policies.base import Action, Policy, Verdict
 from .policies.decay import DecayPolicy
 
-__all__ = ["DecayEngine", "SweepReport", "COLD_FLAG", "STRENGTH_FIELD", "SWEPT_AT_FIELD"]
+__all__ = [
+    "COLD_FLAG",
+    "STRENGTH_FIELD",
+    "SWEPT_AT_FIELD",
+    "DecayEngine",
+    "EvictionLimitExceeded",
+    "ScopeNotSupported",
+    "SweepReport",
+]
 
 COLD_FLAG = "decay_cold"
 STRENGTH_FIELD = "decay_strength"
@@ -40,6 +49,7 @@ class SweepReport:
     promoted_ids: List[str] = field(default_factory=list)
     previously_cold: Set[str] = field(default_factory=set)
     eviction_limit_exceeded: bool = False
+    scope: Any = None
 
     @property
     def scanned(self) -> int:
@@ -108,11 +118,16 @@ class DecayEngine:
 
     # -- read phase ------------------------------------------------------
 
-    def evaluate(self, *, now: Optional[datetime] = None) -> SweepReport:
-        """Judge every record without touching the store."""
+    def evaluate(
+        self, *, now: Optional[datetime] = None, scope: Any = None
+    ) -> SweepReport:
+        """Judge records without touching the store.
+
+        ``scope`` narrows which records are read; ``None`` reads all of them.
+        """
         moment = now or utcnow()
-        report = SweepReport(started_at=moment)
-        for record in self.adapter.iter_records(batch_size=self.batch_size):
+        report = SweepReport(started_at=moment, scope=scope)
+        for record in self._iter_records(scope):
             verdict = self.policy.evaluate(record, now=moment)
             if _is_truthy(record.metadata.get(COLD_FLAG)):
                 report.previously_cold.add(record.id)
@@ -122,17 +137,59 @@ class DecayEngine:
         report.finished_at = utcnow()
         return report
 
+    def _iter_records(self, scope: Any):
+        """Stream from the adapter, passing a scope only when there is one.
+
+        Omitting the keyword entirely when unscoped keeps adapters written
+        against the older two-argument protocol working unchanged.
+        """
+        if scope is None:
+            return self.adapter.iter_records(batch_size=self.batch_size)
+        if not self._adapter_accepts_scope():
+            raise ScopeNotSupported(
+                f"{type(self.adapter).__name__}.iter_records() takes no 'scope' "
+                "parameter, so this sweep cannot be narrowed. Sweeping the whole "
+                "store instead could delete records you meant to exclude, so "
+                "this is an error rather than a fallback."
+            )
+        return self.adapter.iter_records(batch_size=self.batch_size, scope=scope)
+
+    def _adapter_accepts_scope(self) -> bool:
+        """Whether this adapter's `iter_records` understands a scope."""
+        try:
+            parameters = inspect.signature(self.adapter.iter_records).parameters
+        except (TypeError, ValueError):  # pragma: no cover - exotic callables
+            return True  # not introspectable; let the call decide
+        if any(p.kind is p.VAR_KEYWORD for p in parameters.values()):
+            return True
+        return "scope" in parameters
+
     # -- write phase -----------------------------------------------------
 
     def sweep(
-        self, *, dry_run: bool = True, now: Optional[datetime] = None
+        self,
+        *,
+        dry_run: bool = True,
+        now: Optional[datetime] = None,
+        scope: Any = None,
     ) -> SweepReport:
         """Evaluate the store, and apply the verdicts unless this is a dry run.
 
         Dry run is the default. Pass ``dry_run=False`` deliberately.
+
+        Args:
+            dry_run: Decide without writing. The report is identical either way
+                apart from ``applied``.
+            now: The instant to score against. Defaults to now; pass it to make
+                a sweep reproducible.
+            scope: A backend-specific filter narrowing which records are swept.
+                ``None`` sweeps everything, which is the default and the
+                behavior of every release before scoping existed. Records outside
+                the scope are not read, not judged, and not touched -- they do
+                not appear in the report at all.
         """
         moment = now or utcnow()
-        report = self.evaluate(now=moment)
+        report = self.evaluate(now=moment, scope=scope)
 
         # Record the decisions before acting on any of them. Both paths read
         # these same lists, so a dry run reports exactly what applying would do
@@ -205,3 +262,7 @@ def _is_truthy(value: Any) -> bool:
 
 class EvictionLimitExceeded(RuntimeError):
     """Raised when a sweep would delete more records than ``max_evictions``."""
+
+
+class ScopeNotSupported(TypeError):
+    """Raised when a scope is given to an adapter that cannot narrow a sweep."""

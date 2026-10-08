@@ -14,6 +14,7 @@ from .engine import (
     SWEPT_AT_FIELD,
     DecayEngine,
     EvictionLimitExceeded,
+    ScopeNotSupported,
     SweepReport,
 )
 from .models import FieldMap, MemoryRecord, MemorySignals, utcnow
@@ -33,6 +34,7 @@ __all__ = [
     "MemorySignals",
     "Policy",
     "STRENGTH_FIELD",
+    "ScopeNotSupported",
     "SWEPT_AT_FIELD",
     "SweepReport",
     "Verdict",

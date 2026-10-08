@@ -15,7 +15,7 @@ import pytest
 
 from conftest import record
 from decay_engine import COLD_FLAG, STRENGTH_FIELD, DecayEngine, DecayPolicy
-from decay_engine.adapters.pgvector import PgVectorAdapter
+from decay_engine.adapters.pgvector import PgVectorAdapter, PgVectorScope
 
 
 class FakeCursor:
@@ -44,23 +44,65 @@ class FakeCursor:
 
     # -- DB-API ----------------------------------------------------------
 
+    @staticmethod
+    def _where(sql):
+        """The WHERE clause, or '' -- paren-aware so a scope can contain AND."""
+        if " WHERE " not in sql:
+            return ""
+        start = sql.index(" WHERE ") + 7
+        end = sql.index(" ORDER BY") if " ORDER BY" in sql else len(sql)
+        return sql[start:end].strip()
+
+    @staticmethod
+    def _split_scope(where):
+        """Peel the leading ``(scope)`` conjunct off a WHERE clause."""
+        if not where.startswith("("):
+            return "", where
+        depth = 0
+        for index, char in enumerate(where):
+            depth += (char == "(") - (char == ")")
+            if depth == 0:
+                scope = where[1:index]
+                rest = where[index + 1 :].strip()
+                return scope, rest[4:].strip() if rest.startswith("AND ") else rest
+        raise AssertionError(f"unbalanced parentheses in {where!r}")
+
+    def _scope_matches(self, row, scope, params):
+        """Evaluate the scope forms the adapter builds."""
+        if not scope:
+            return True
+        if "@>" in scope:  # metadata @> %s::jsonb
+            wanted = json.loads(params[0])
+            held = row.get(self.db.metadata_column) or {}
+            return all(held.get(k) == v for k, v in wanted.items())
+        # one or more `"col" = %s` conjuncts, params in order
+        values = list(params)
+        for conjunct in scope.split(" AND "):
+            column = conjunct.split("=")[0].strip().strip('"')
+            if row.get(column) != values.pop(0):
+                return False
+        return True
+
     def execute(self, sql, params=None):
         self.db.statements.append((sql, params))
-        params = params or ()
+        params = list(params or ())
 
         if sql.startswith("SELECT COUNT(*)"):
+            scope, _ = self._split_scope(self._where(sql))
+            rows = [r for r in self.db.rows if self._scope_matches(r, scope, params)]
             self.description = [("count",)]
-            self._rows = [(len(self.db.rows),)]
+            self._rows = [(len(rows),)]
             return
 
         if sql.startswith("SELECT"):
             columns = self._columns(sql)
+            limit = params.pop()  # LIMIT %s is always the last parameter
+            scope, keyset = self._split_scope(self._where(sql))
+            after = params.pop() if keyset else None
             rows = sorted(self.db.rows, key=lambda r: r["id"])
-            if " > %s" in sql:
-                after, limit = params
+            rows = [r for r in rows if self._scope_matches(r, scope, params)]
+            if after is not None:
                 rows = [r for r in rows if r["id"] > after]
-            else:
-                (limit,) = params
             self.description = [(c,) for c in columns]
             self._rows = [self._row_tuple(r, columns) for r in rows[:limit]]
             return
@@ -408,7 +450,8 @@ class TestAgainstRealPostgres:
                         metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
                         created_at timestamptz,
                         last_accessed_at timestamptz,
-                        access_count int DEFAULT 0
+                        access_count int DEFAULT 0,
+                        tenant_id text
                     )"""
                 )
             conn.commit()
@@ -494,3 +537,199 @@ class TestAgainstRealPostgres:
             embedding, metadata = cur.fetchone()
         assert str(embedding) == "[0.7,0.8,0.9]"
         assert metadata[COLD_FLAG] is True
+
+    def test_scoped_sweep_against_real_sql(self, table, now, policy):
+        """Both scope shapes, executed by Postgres rather than a double."""
+        name, conn = table
+        with conn.cursor() as cur:
+            cur.executemany(
+                f"INSERT INTO {name} (id, document, embedding, metadata, tenant_id) "
+                f"VALUES (%s, %s, %s, %s::jsonb, %s)",
+                [
+                    (f"{tenant}-{age}", "m", "[0.1,0.2,0.3]",
+                     json.dumps({"created_at": (now - timedelta(days=days + 20)).isoformat(),
+                                 "last_accessed_at": (now - timedelta(days=days)).isoformat(),
+                                 "tenant_id": tenant}),
+                     tenant)
+                    for tenant in ("acme", "globex")
+                    for age, days in (("hot", 1), ("dead", 400))
+                ],
+            )
+        conn.commit()
+
+        adapter = PgVectorAdapter(conn, table=name)
+        assert adapter.count() == 4
+
+        # JSONB containment
+        report = DecayEngine(adapter, policy).sweep(
+            dry_run=False, now=now, scope={"tenant_id": "acme"}
+        )
+        assert report.evicted_ids == ["acme-dead"]
+        assert adapter.count() == 3
+
+        # a real column, via a validated equality predicate
+        report = DecayEngine(adapter, policy).sweep(
+            dry_run=False, now=now,
+            scope=PgVectorScope.for_columns({"tenant_id": "globex"}),
+        )
+        assert report.evicted_ids == ["globex-dead"]
+        assert adapter.count() == 2
+        assert adapter.count({"tenant_id": "acme"}) == 1
+
+    def test_arbitrary_sql_predicate_against_real_sql(self, table, now, policy):
+        """A raw fragment the fake cannot evaluate, proving real SQL passthrough."""
+        name, conn = table
+        with conn.cursor() as cur:
+            cur.executemany(
+                f"INSERT INTO {name} (id, document, embedding, metadata, access_count) "
+                f"VALUES (%s, %s, %s, %s::jsonb, %s)",
+                [
+                    (rid, "m", "[0.1,0.2,0.3]",
+                     json.dumps({"created_at": (now - timedelta(days=420)).isoformat(),
+                                 "last_accessed_at": (now - timedelta(days=400)).isoformat()}),
+                     hits)
+                    for rid, hits in (("rare", 0), ("popular", 99))
+                ],
+            )
+        conn.commit()
+
+        adapter = PgVectorAdapter(conn, table=name)
+        report = DecayEngine(adapter, policy).sweep(
+            dry_run=False, now=now,
+            scope=PgVectorScope("access_count < %s AND document IS NOT NULL", (10,)),
+        )
+        assert report.evicted_ids == ["rare"]
+        assert adapter.count() == 1
+
+
+class TestScopedSweeps:
+    """Narrowing a sweep to a subset of rows."""
+
+    @pytest.fixture
+    def tenants(self, now):
+        """Two tenants, each with one fresh and one abandoned memory."""
+        rows = []
+        for tenant in ("acme", "globex"):
+            rows.append(
+                {**row(f"{tenant}-hot", record(f"{tenant}-hot", idle_days=1, now=now)),
+                 "tenant_id": tenant}
+            )
+            rows.append(
+                {**row(f"{tenant}-dead", record(f"{tenant}-dead", idle_days=300, now=now)),
+                 "tenant_id": tenant}
+            )
+            rows[-1]["metadata"]["tenant_id"] = tenant
+            rows[-2]["metadata"]["tenant_id"] = tenant
+        return FakeConnection(rows)
+
+    def test_unscoped_sweep_still_covers_the_whole_table(self, tenants, policy, now):
+        report = DecayEngine(PgVectorAdapter(tenants), policy).sweep(now=now)
+        assert report.scanned == 4
+        assert sorted(report.evicted_ids) == ["acme-dead", "globex-dead"]
+
+    def test_mapping_scope_filters_by_jsonb_containment(self, tenants, policy, now):
+        adapter = PgVectorAdapter(tenants)
+        report = DecayEngine(adapter, policy).sweep(
+            now=now, scope={"tenant_id": "acme"}
+        )
+        assert report.scanned == 2
+        assert report.evicted_ids == ["acme-dead"]
+        sql = tenants.statements[0][0]
+        assert "@> %s::jsonb" in sql
+
+    def test_scoped_apply_leaves_other_rows_untouched(self, tenants, policy, now):
+        adapter = PgVectorAdapter(tenants)
+        DecayEngine(adapter, policy).sweep(
+            dry_run=False, now=now, scope={"tenant_id": "acme"}
+        )
+        remaining = sorted(r["id"] for r in tenants.rows)
+        assert remaining == ["acme-hot", "globex-dead", "globex-hot"]
+
+    def test_column_scope_filters_by_real_column(self, tenants, policy, now):
+        adapter = PgVectorAdapter(tenants)
+        scope = PgVectorScope.for_columns({"tenant_id": "globex"})
+        report = DecayEngine(adapter, policy).sweep(dry_run=False, now=now, scope=scope)
+        assert report.evicted_ids == ["globex-dead"]
+        assert '"tenant_id" = %s' in tenants.statements[0][0]
+
+    def test_scope_params_precede_the_keyset_param(self, now):
+        """Parameter order must mirror the clause order or paging breaks."""
+        rows = [
+            {**row(f"m-{i:03d}", record(f"m-{i:03d}", idle_days=1, now=now)),
+             "tenant_id": "acme"}
+            for i in range(150)
+        ]
+        connection = FakeConnection(rows)
+        adapter = PgVectorAdapter(connection)
+        scope = PgVectorScope.for_columns({"tenant_id": "acme"})
+        found = list(adapter.iter_records(batch_size=100, scope=scope))
+
+        assert len(found) == 150
+        first_sql, first_params = connection.statements[0]
+        second_sql, second_params = connection.statements[1]
+        assert first_params == ("acme", 100)
+        assert second_params == ("acme", "m-099", 100)
+        assert '"id" > %s' in second_sql and "ORDER BY" in second_sql
+
+    def test_scope_and_keyset_are_anded(self, tenants):
+        adapter = PgVectorAdapter(tenants)
+        list(adapter.iter_records(batch_size=1, scope={"tenant_id": "acme"}))
+        combined = [s for s, _ in tenants.statements if '"id" > %s' in s]
+        assert combined and " AND " in combined[0]
+
+    def test_count_accepts_a_scope(self, tenants):
+        adapter = PgVectorAdapter(tenants)
+        assert adapter.count() == 4
+        assert adapter.count({"tenant_id": "acme"}) == 2
+
+    def test_raw_scope_carries_its_own_parameters(self, tenants):
+        adapter = PgVectorAdapter(tenants)
+        list(adapter.iter_records(scope=PgVectorScope('"tenant_id" = %s', ("acme",))))
+        assert tenants.statements[0][1] == ("acme", 256)
+
+
+class TestScopeValidation:
+    def test_an_empty_predicate_is_refused(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            PgVectorScope("")
+
+    def test_a_statement_terminator_is_refused(self):
+        with pytest.raises(ValueError, match="';'"):
+            PgVectorScope("tenant_id = 'acme'; DROP TABLE memories")
+
+    def test_for_columns_validates_column_names(self):
+        with pytest.raises(ValueError):
+            PgVectorScope.for_columns({"tenant_id); DROP TABLE x --": "acme"})
+
+    def test_for_columns_needs_at_least_one_condition(self):
+        """An empty scope must not quietly become 'everything'."""
+        with pytest.raises(ValueError, match="at least one"):
+            PgVectorScope.for_columns({})
+
+    def test_an_empty_mapping_scope_is_refused(self, connection):
+        with pytest.raises(ValueError, match="empty mapping"):
+            list(PgVectorAdapter(connection).iter_records(scope={}))
+
+    def test_an_unknown_scope_shape_is_refused(self, connection):
+        with pytest.raises(TypeError, match="must be a mapping"):
+            list(PgVectorAdapter(connection).iter_records(scope=["tenant", "acme"]))
+
+    def test_mapping_scope_needs_a_jsonb_column(self, now):
+        connection = FakeConnection(
+            [{"id": "a", "document": "d", "created_at": now, "tenant_id": "acme"}]
+        )
+        adapter = PgVectorAdapter(
+            connection, metadata_column=None, extra_columns=("created_at",)
+        )
+        with pytest.raises(ValueError, match="for_columns"):
+            list(adapter.iter_records(scope={"tenant_id": "acme"}))
+
+    def test_for_columns_works_without_a_jsonb_column(self, now):
+        connection = FakeConnection(
+            [{"id": "a", "document": "d", "created_at": now, "tenant_id": "acme"}]
+        )
+        adapter = PgVectorAdapter(
+            connection, metadata_column=None, extra_columns=("created_at",)
+        )
+        scope = PgVectorScope.for_columns({"tenant_id": "acme"})
+        assert len(list(adapter.iter_records(scope=scope))) == 1

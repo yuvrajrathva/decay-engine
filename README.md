@@ -25,15 +25,43 @@ cold or removes them.
 - [docs/access-tracking.md](docs/access-tracking.md) — the fields your
   application must maintain, when to write them, and how decay degrades without
   them. **The library does not track access itself.**
+- [docs/scoped-sweeps.md](docs/scoped-sweeps.md) — sweeping one tenant, user, or
+  subset instead of the whole store.
 - [STATUS.md](STATUS.md) — what is built, what is not, and the vocabulary.
 
 ## Install
 
 ```bash
-pip install decay-engine              # core, no dependencies
-pip install "decay-engine[chroma]"    # with the Chroma adapter
-pip install "decay-engine[pgvector]"  # with the pgvector adapter
+pip install decay-engine                # core, zero dependencies
+pip install "decay-engine[chroma]"      # + Chroma adapter
+pip install "decay-engine[pgvector]"    # + pgvector adapter
+pip install "decay-engine[all]"         # + both
 ```
+
+Requires Python 3.9 or newer. The core has no third-party dependencies at all —
+installing it pulls nothing else — and the adapter modules import fine without
+their drivers, so you only need a driver to actually connect.
+
+Not on PyPI yet. To install from a clone:
+
+```bash
+git clone <this repo> && cd decay-engine
+pip install -e ".[dev]"                 # editable, with both backends and pytest
+```
+
+Or build a distribution and install that:
+
+```bash
+pip install build
+python -m build                         # writes dist/*.whl and dist/*.tar.gz
+pip install "dist/decay_engine-0.1.0-py3-none-any.whl[all]"
+```
+
+`./scripts/verify_build.sh` does the whole thing end to end: builds both
+artifacts, checks the wheel ships `py.typed` and no secrets, installs the core
+into a clean virtualenv, asserts nothing third-party came with it, resolves each
+extra, and runs the test suite against the *installed* package from a directory
+with no source tree in it.
 
 ## Use
 
@@ -107,6 +135,35 @@ results = collection.query(
 
 If a demoted memory gets retrieved again, the next sweep clears the cold flag.
 Records come back.
+
+## Scoped sweeps
+
+A sweep covers the whole store unless you narrow it:
+
+```python
+engine.sweep(dry_run=False, scope={"tenant_id": "acme"})
+```
+
+Records outside the scope are not read, not judged, and not touched — they do not
+appear in the report. The core never inspects a scope; it hands the object to the
+adapter, which translates it for its backend. So the library has no notion of a
+tenant, user, or namespace, and you are not limited to the ones it imagined.
+
+| Adapter | Accepts |
+| --- | --- |
+| Chroma | a mapping used as Chroma's `where` (full operator syntax), or `ChromaScope(where=..., where_document=...)` |
+| pgvector | a mapping matched by JSONB containment (`metadata @> …`), or `PgVectorScope(sql, params)` / `PgVectorScope.for_columns({...})` |
+| in-memory | a predicate, or a mapping of metadata values that must all match |
+
+Give a scope to an adapter that cannot narrow a sweep and you get
+`ScopeNotSupported` before anything is read — silently sweeping everything could
+delete the records you meant to exclude.
+
+`max_evictions` counts deletions *within the scope*, which makes a per-tenant
+ceiling much tighter than the same number applied to one global sweep.
+[docs/scoped-sweeps.md](docs/scoped-sweeps.md) has the full API, and
+`python examples/scoped_sweep.py` runs a two-tenant sweep with different
+retention per tenant.
 
 ## Safety
 
@@ -229,8 +286,12 @@ Implement three methods:
 
 ```python
 class MyStore:
-    def iter_records(self, *, batch_size=256):
-        """Yield every MemoryRecord. Page; do not materialize the store."""
+    def iter_records(self, *, batch_size=256, scope=None):
+        """Yield MemoryRecords. Page; do not materialize the store.
+
+        scope is backend-specific and optional; None must mean every record.
+        Omit the parameter entirely if you do not support scoping.
+        """
 
     def update_metadata(self, updates):
         """Merge {id: patch} into existing metadata. Never drop unmentioned keys."""
@@ -248,15 +309,20 @@ pointing them at production.
 Early. Time-and-usage decay is implemented and tested; near-duplicate merging,
 consolidation, and contradiction resolution are not.
 
-Chroma and pgvector adapters ship. See [STATUS.md](STATUS.md) for the full
-inventory.
+Chroma and pgvector adapters ship, sweeps can be scoped to a subset of a store,
+and the package builds and installs as a proper distribution. Not published to
+PyPI. See [STATUS.md](STATUS.md) for the full inventory.
 
 ## Development
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -e ".[dev,chroma,pgvector]"
+python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest
+.venv/bin/python -m pytest --no-header -q    # 160 tests with both backends up
+./scripts/verify_build.sh                    # build + install verification
 ```
+
+The `dev` extra pulls both backends, pytest, and `build`.
 
 The suite runs with no database and no `chromadb` installed. Both adapters are
 tested against doubles that reproduce the real backends' awkward parts — Chroma

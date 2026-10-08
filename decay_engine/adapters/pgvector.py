@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterator, Mapping, Optional, Sequence, Tuple
 
 from ..models import MemoryRecord
 from .base import StoreAdapter, chunked
 
-__all__ = ["PgVectorAdapter"]
+__all__ = ["PgVectorAdapter", "PgVectorScope"]
 
 # Identifiers are interpolated into SQL, never parameterized, so they are
 # validated rather than escaped. Postgres caps identifiers at 63 bytes.
@@ -62,6 +63,56 @@ def _jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+@dataclass(frozen=True)
+class PgVectorScope:
+    """A SQL predicate narrowing a sweep to some of a table's rows.
+
+    The fragment goes into the sweep's ``WHERE`` clause, combined with the
+    keyset paging condition using ``AND``. Values belong in ``params``, never
+    interpolated into ``sql``:
+
+        PgVectorScope("tenant_id = %s AND NOT archived", ("acme",))
+
+    For plain column equality, `for_columns` builds the fragment for you and
+    validates the column names. A mapping passed as a scope is shorthand for
+    JSONB containment on the metadata column instead.
+    """
+
+    sql: str
+    params: Tuple[Any, ...] = field(default=())
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sql, str) or not self.sql.strip():
+            raise ValueError(
+                "PgVectorScope.sql must be a non-empty predicate; an empty "
+                "scope would silently sweep the whole table"
+            )
+        if ";" in self.sql:
+            raise ValueError(
+                "PgVectorScope.sql may not contain ';' -- it is a WHERE "
+                "fragment, and values belong in params rather than inline"
+            )
+        object.__setattr__(self, "params", tuple(self.params))
+
+    @classmethod
+    def for_columns(cls, conditions: Mapping[str, Any]) -> "PgVectorScope":
+        """Build an equality predicate over real columns, names validated.
+
+            PgVectorScope.for_columns({"tenant_id": "acme", "archived": False})
+        """
+        if not conditions:
+            raise ValueError(
+                "for_columns needs at least one condition; an empty scope would "
+                "silently sweep the whole table"
+            )
+        parts = []
+        params = []
+        for column, value in conditions.items():
+            parts.append(f"{_quote(column, what='scope column')} = %s")
+            params.append(value)
+        return cls(" AND ".join(parts), tuple(params))
 
 
 class PgVectorAdapter(StoreAdapter):
@@ -156,14 +207,48 @@ class PgVectorAdapter(StoreAdapter):
             if callable(committer):
                 committer()
 
+    def _scope_clause(self, scope: Any) -> Tuple[str, Tuple[Any, ...]]:
+        """Translate a scope into a SQL fragment and its parameters."""
+        if scope is None:
+            return "", ()
+        if isinstance(scope, PgVectorScope):
+            return scope.sql, scope.params
+        if isinstance(scope, Mapping):
+            if not scope:
+                raise ValueError(
+                    "an empty mapping is not a valid scope; pass None to sweep "
+                    "the whole table deliberately"
+                )
+            if self._metadata is None:
+                raise ValueError(
+                    "a mapping scope filters the JSONB metadata column, but this "
+                    "adapter was built without one; use PgVectorScope.for_columns "
+                    "to filter on real columns instead"
+                )
+            payload = json.dumps(
+                {key: _jsonable(value) for key, value in scope.items()}
+            )
+            return f"{self._metadata} @> %s::jsonb", (payload,)
+        raise TypeError(
+            "PgVectorAdapter scope must be a mapping (JSONB containment) or a "
+            f"PgVectorScope, got {type(scope).__name__}"
+        )
+
     # -- store ops -------------------------------------------------------
 
-    def iter_records(self, *, batch_size: int = 256) -> Iterator[MemoryRecord]:
-        """Stream every row, paging by the id column.
+    def iter_records(
+        self, *, batch_size: int = 256, scope: Any = None
+    ) -> Iterator[MemoryRecord]:
+        """Stream rows, paging by the id column.
 
         Paging is keyset-based (``WHERE id > last_seen``) rather than
         ``OFFSET``, so rows are neither skipped nor repeated if the table shifts
         underneath a long sweep.
+
+        ``scope`` may be a mapping, matched against the JSONB metadata column
+        with ``@>`` containment, or a `PgVectorScope` carrying an arbitrary
+        parameterized predicate. It is ANDed with the paging condition, so
+        paging stays correct within the filtered set.
         """
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
@@ -176,22 +261,26 @@ class PgVectorAdapter(StoreAdapter):
         selected.extend(self._extra)
         columns = ", ".join(selected)
 
+        scope_sql, scope_params = self._scope_clause(scope)
+
         last_id: Any = None
         while True:
-            if last_id is None:
-                sql = (
-                    f"SELECT {columns} FROM {self._table} "
-                    f"ORDER BY {self._id} ASC LIMIT %s"
-                )
-                params: Tuple[Any, ...] = (batch_size,)
-            else:
-                sql = (
-                    f"SELECT {columns} FROM {self._table} "
-                    f"WHERE {self._id} > %s ORDER BY {self._id} ASC LIMIT %s"
-                )
-                params = (last_id, batch_size)
+            conditions = []
+            params: list = []
+            if scope_sql:
+                conditions.append(f"({scope_sql})")
+                params.extend(scope_params)
+            if last_id is not None:
+                conditions.append(f"{self._id} > %s")
+                params.append(last_id)
+            where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+            params.append(batch_size)
 
-            rows = self._execute(sql, params) or []
+            sql = (
+                f"SELECT {columns} FROM {self._table}{where} "
+                f"ORDER BY {self._id} ASC LIMIT %s"
+            )
+            rows = self._execute(sql, tuple(params)) or []
             if not rows:
                 return
 
@@ -268,6 +357,10 @@ class PgVectorAdapter(StoreAdapter):
             self._execute(sql, (list(batch),))
         self._after_write()
 
-    def count(self) -> int:
-        rows = self._execute(f"SELECT COUNT(*) FROM {self._table}") or [(0,)]
+    def count(self, scope: Any = None) -> int:
+        """Rows in the table, or in ``scope`` if one is given."""
+        scope_sql, scope_params = self._scope_clause(scope)
+        where = f" WHERE ({scope_sql})" if scope_sql else ""
+        sql = f"SELECT COUNT(*) FROM {self._table}{where}"
+        rows = self._execute(sql, tuple(scope_params) or None) or [(0,)]
         return int(rows[0][0])
