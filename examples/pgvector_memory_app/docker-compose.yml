@@ -1,0 +1,53 @@
+# Self-contained demo stack: Postgres with pgvector, plus the example app.
+#
+#   docker compose run --rm app demo
+#
+# Deliberately separate from the repository-root docker-compose.yml, which is
+# the development database for the library's own test suite. Different container
+# names, volume, and host port, so starting this cannot disturb that.
+#
+# Every value has a default, so no .env file is required. Copy .env.example to
+# .env to override any of them.
+
+name: decay-demo
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: decay-demo-pg
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-decay_demo}
+      POSTGRES_USER: ${POSTGRES_USER:-decay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-decay}
+    ports:
+      # Published only so you can poke at the data with psql from the host.
+      # The app reaches Postgres over the compose network, not this port.
+      - "${POSTGRES_PORT:-55433}:5432"
+    volumes:
+      - demo_pgdata:/var/lib/postgresql/data
+      # Creates the vector extension, the table, and the indexes on first boot.
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-decay} -d ${POSTGRES_DB:-decay_demo}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  app:
+    build:
+      # The repository root, so the Dockerfile can install the local library.
+      context: ../..
+      dockerfile: examples/pgvector_memory_app/Dockerfile
+    container_name: decay-demo-app
+    depends_on:
+      postgres:
+        # Nothing starts until init.sql has run and Postgres accepts queries.
+        condition: service_healthy
+    environment:
+      # One line on purpose: a folded YAML scalar would insert a space here.
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-decay}:${POSTGRES_PASSWORD:-decay}@postgres:5432/${POSTGRES_DB:-decay_demo}"
+    # Overridden by whatever you pass to `docker compose run --rm app ...`.
+    command: ["demo"]
+
+volumes:
+  demo_pgdata:

@@ -58,7 +58,8 @@ Two distinctions in that table carry weight:
 | **Scoped sweeps** | `engine.py`, both adapters | **Done.** `sweep(scope=…)` and `evaluate(scope=…)` narrow a sweep. Chroma takes a `where` mapping or `ChromaScope`; pgvector takes a JSONB-containment mapping or a parameterized `PgVectorScope`; the in-memory store takes a predicate or mapping. Unscoped behavior is unchanged, and the keyword is not even passed when unscoped, so pre-scope adapters still work. An adapter that cannot scope raises `ScopeNotSupported` rather than widening. |
 | **Packaging** | `pyproject.toml`, `MANIFEST.in`, `LICENSE` | **Done.** PEP 621 metadata, classifiers, MIT license, `py.typed` (PEP 561). Core has no dependencies; `chroma`, `pgvector`, `all` and `dev` extras. Wheel carries only the package; sdist also carries tests, docs and the example. |
 | Build verification | `scripts/verify_build.sh` | **Done.** Builds both artifacts, asserts the wheel ships `py.typed` and no tests or `.env`, installs the core into a clean virtualenv and asserts nothing third-party came with it, resolves every extra, then runs the suite against the installed package from a directory containing no source tree. |
-| Worked example | `examples/preview_sweep.py` | **Done.** Runnable: prints a full verdict table over seven synthetic memories. |
+| Worked examples | `examples/preview_sweep.py`, `examples/scoped_sweep.py` | **Done.** Runnable with no database: a verdict table over synthetic memories, and a two-tenant scoped sweep. |
+| **Integration demo** | `examples/pgvector_memory_app/` | **Done and verified from a clean, no-cache Docker build.** A CLI memory app on Postgres + pgvector: deterministic embeddings, similarity search, app-side access tracking, dry-run vs applied sweeps, and three retrieval policies for demoted memories. Own compose stack, isolated from the root dev database. Asserts its own outcomes (19 checks). |
 
 ### The scoring model, concretely
 
@@ -114,8 +115,7 @@ the wrong failure direction.
   deletions then act on the ids that read returned. There is no separate
   server-side scoped `DELETE`, so a very large scoped eviction is still one
   delete per batch of ids rather than one statement.
-- **Publishing.** Builds locally, but not uploaded to PyPI, and not committed to
-  git — the directory is untracked inside the parent `Devdev` repo.
+- **Publishing.** Builds locally, but not uploaded to PyPI.
 
 ## Verification
 

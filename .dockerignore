@@ -1,0 +1,17 @@
+# Keeps the Docker build context small. The example's Dockerfile builds from the
+# repository root so it can install the local library, and without this the
+# virtualenv and build artifacts would be shipped to the daemon.
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.git/
+.env
+.env.*
+!.env.example

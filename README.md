@@ -27,6 +27,8 @@ cold or removes them.
   them. **The library does not track access itself.**
 - [docs/scoped-sweeps.md](docs/scoped-sweeps.md) — sweeping one tenant, user, or
   subset instead of the whole store.
+- [examples/pgvector_memory_app/](examples/pgvector_memory_app/) — a runnable
+  memory application on Postgres + pgvector, entirely in Docker.
 - [STATUS.md](STATUS.md) — what is built, what is not, and the vocabulary.
 
 ## Install
@@ -88,6 +90,28 @@ for verdict in report.by_action(Action.EVICT):
 ```
 
 Run `python examples/preview_sweep.py` for a full worked sweep over sample data.
+
+## Examples
+
+| example | needs | shows |
+| --- | --- | --- |
+| [`examples/preview_sweep.py`](examples/preview_sweep.py) | nothing | a verdict table over synthetic memories |
+| [`examples/scoped_sweep.py`](examples/scoped_sweep.py) | nothing | two tenants swept with different retention |
+| [`examples/pgvector_memory_app/`](examples/pgvector_memory_app/) | Docker | a real app: pgvector search, access tracking, sweeps |
+
+The last one is the complete picture — a CLI that stores and searches memories in
+Postgres, records its own retrievals, and sweeps them:
+
+```bash
+cd examples/pgvector_memory_app
+docker compose run --rm app demo
+```
+
+That starts Postgres with `pgvector`, creates the schema, seeds eight memories
+chosen so every outcome (`KEEP`, `DEMOTE`, `EVICT`, `SKIP`) is reachable, and
+walks dry-run versus applied sweeps, the three ways demoted memories can affect
+retrieval, and promotion of a memory that gets used again. No Python or Postgres
+install needed, and it asserts its own outcomes.
 
 ## How scoring works
 
